@@ -1021,7 +1021,8 @@ class Scion(torch.optim.Optimizer):
                 # Reshape bank parameters (e.g., attn_bank, mlp_bank) to their
                 # logical 2D-per-layer shape for proper Newton-Schulz processing.
                 target_shape = getattr(p, "reshape", None)
-                if target_shape is not None:
+                if target_shape is not None and group["norm"] == "Spectral":
+                    # print(f"Reshaping gradient from {g.shape} to {target_shape}")
                     g = g.reshape(target_shape)
 
                 if momentum != 1:
@@ -1034,7 +1035,7 @@ class Scion(torch.optim.Optimizer):
                 update = scale * norm_backend.lmo(g)
 
                 # Reshape update back to original parameter shape
-                if target_shape is not None:
+                if target_shape is not None and group["norm"] == "Spectral":
                     update = update.reshape(p.shape)
 
                 if unconstrained:

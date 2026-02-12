@@ -986,6 +986,18 @@ norm_dict = {"Spectral": Spectral, "Sign": Sign}
 
 
 class Scion(torch.optim.Optimizer):
+    """Scion optimizer with embed/lm_head weight tying support.
+
+    While tied (before split_embed is called):
+    - embed.grad.T is merged into lm_head.grad
+    - Only lm_head receives optimizer updates
+    - embed.data is synced from lm_head.data.T after each step
+
+    After split_embed is called:
+    - lm_head's momentum buffer is copied (transposed) to embed
+    - Both parameters receive independent updates
+    """
+
     def __init__(
         self,
         params,
@@ -1005,7 +1017,33 @@ class Scion(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
 
+        # Locate lm_head and embed parameters by label for weight tying.
+        # Both must be present — tying is a core part of the training recipe.
+        self._lm_head_param = None
+        self._embed_param = None
+        for group in self.param_groups:
+            for p in group["params"]:
+                label = getattr(p, "label", None)
+                if label == "lm_head":
+                    self._lm_head_param = p
+                elif label == "embed":
+                    self._embed_param = p
+        assert (
+            self._lm_head_param is not None and self._embed_param is not None
+        ), "Scion requires both 'lm_head' and 'embed' labeled parameters for weight tying"
+        self._is_split = False
+
     def step(self):
+        # While tied: merge embed gradient into lm_head, suppress embed update.
+        # Scion skips params with grad=None, so embed won't be updated below.
+        if not self._is_split:
+            if (
+                self._lm_head_param.grad is not None
+                and self._embed_param.grad is not None
+            ):
+                self._lm_head_param.grad.add_(self._embed_param.grad.T)
+            self._embed_param.grad = None
+
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
@@ -1022,7 +1060,6 @@ class Scion(torch.optim.Optimizer):
                 # logical 2D-per-layer shape for proper Newton-Schulz processing.
                 target_shape = getattr(p, "reshape", None)
                 if target_shape is not None and group["norm"] == "Spectral":
-                    # print(f"Reshaping gradient from {g.shape} to {target_shape}")
                     g = g.reshape(target_shape)
 
                 if momentum != 1:
@@ -1042,6 +1079,39 @@ class Scion(torch.optim.Optimizer):
                     p.data.add_(update, alpha=-lr)  # Unconstrained Scion
                 else:
                     p.data.mul_(1 - lr).add_(update, alpha=-lr)  # Scion
+
+        # While tied: sync embed weights from lm_head
+        if not self._is_split:
+            self._embed_param.data.copy_(self._lm_head_param.data.T)
+
+        # Clear gradients (NorMuonAndAdam did this internally)
+        self.zero_grad(set_to_none=True)
+
+    def split_embed(self):
+        """Copy lm_head's momentum buffer (transposed) to embed and untie.
+
+        During the tied phase, lm_head's momentum buffer accumulates the EMA of
+        (lm_head.grad + embed.grad.T). Transposing gives the EMA from embed's
+        perspective: (lm_head.grad.T + embed.grad). This ensures a smooth
+        transition when embed starts receiving independent updates.
+
+        Unlike NorMuonAndAdam, no all-gather/reshard is needed since Scion uses
+        DDP all-reduce (full gradients on every rank) rather than reduce-scatter.
+        """
+        if self._is_split:
+            return
+        lm_state = self.state.get(self._lm_head_param, {})
+        embed_state = self.state[self._embed_param]
+        if "momentum_buffer" in lm_state:
+            embed_state["momentum_buffer"] = lm_state["momentum_buffer"].T.clone()
+        self._is_split = True
+
+    def reset(self):
+        """Reset momentum buffers and re-tie embed to lm_head."""
+        for p in self.state:
+            if "momentum_buffer" in self.state[p]:
+                self.state[p]["momentum_buffer"].zero_()
+        self._is_split = False
 
 
 # -----------------------------------------------------------------------------
@@ -2013,7 +2083,7 @@ class TrainingSchedule:
         self.boundaries = list(pairwise(ends))
 
         # Split embed at specified stage (ensure odd step for Adam)
-        # self.split_step = self.boundaries[split_embed_stage][0] | 1
+        self.split_step = self.boundaries[split_embed_stage][0] | 1
 
         # Precompute MTP weights for all steps
         self.mtp_weights = []
@@ -2111,13 +2181,10 @@ def get_muon_momentum(
 
 class TrainingManager:
     """
-    Manages the NorMuonAndAdam for all parameters with explicit ordering.
-        1. Scalars are given higher momentum terms to smooth learning @ChrisJMcCormick
-        2. Adam optimizers are only stepped on odd steps @classiclarryd
-        3. Explicit scatter_order and work_order for communication scheduling (no backward hooks)
-        4. Muon has a linear momentum warmup and cooldown schedule
-        5. Learning rates follow a linear decay schedule
-        6. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
+    Manages the Scion optimizer for all parameters.
+        1. Learning rates follow a linear decay schedule with per-stage multipliers
+        2. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
+        3. DDP handles gradient all-reduce (no manual communication scheduling)
     """
 
     def __init__(self, model):
@@ -2290,12 +2357,12 @@ class TrainingManager:
             momentum=0.1,
             unconstrained=False,
         )
-
+        # Store base learning rates for absolute (not multiplicative) LR scheduling
         for group in self.optimizer.param_groups:
             group["base_lr"] = group["lr"]
 
-        # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
-        # self.split_step = training_schedule.split_step
+        # Split embed from lm_head at 2/3 of training @classiclarryd
+        self.split_step = training_schedule.split_step
 
         self.reset()
 
@@ -2344,24 +2411,24 @@ class TrainingManager:
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
 
+        # Update learning rate using absolute schedule (base_lr * schedule multiplier)
         for group in self.optimizer.param_groups:
             group["lr"] = group["base_lr"] * step_lr
 
+        # Scion.step handles tying (grad merge, weight sync) and zero_grad internally
         self.optimizer.step()
 
-        self.optimizer.zero_grad(set_to_none=True)
-
-        # TODO: uncomment this when we have a way to copy the lm_head optimizer state to the embed optimizer state
-        # At split step: copy lm_head optimizer state to embed and mark as split
-        # if step == self.split_step:
-        #     self.optimizer.copy_lm_state_to_embed()
+        # At split step: copy lm_head momentum to embed and untie.
+        # This happens after the step so the split step itself still uses tied behavior.
+        if step == self.split_step:
+            self.optimizer.split_embed()
 
     def reset(self, state=None):
         if state is not None:
             self.optimizer.load_state_dict(state)
 
-        # Reset Scion momentum buffers and split_embed state
-        # self.optimizer.reset()  # TODO: uncomment this when we have a way to reset the Scion momentum buffers
+        # Reset momentum buffers and re-tie embed to lm_head
+        self.optimizer.reset()
 
         stage, _ = training_schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes

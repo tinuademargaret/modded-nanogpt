@@ -982,7 +982,9 @@ class Spectral(Norm):
             g = zeropower_via_newtonschulz5(g, steps=self.steps)
         elif g.ndim == 3:
             split_baddbmm = g.size(-2) > 1024
-            g = zeropower_via_newtonschulz5_batched(g, steps=self.steps, split_baddbmm=split_baddbmm)
+            g = zeropower_via_newtonschulz5_batched(
+                g, steps=self.steps, split_baddbmm=split_baddbmm
+            )
         else:
             raise ValueError(f"Spectral LMO expects 2D or 3D tensor, got {g.ndim}D")
         d_out, d_in = g.shape[-2], g.shape[-1]
@@ -2340,37 +2342,45 @@ class TrainingManager:
             else:
                 sign_scalar_params.append(param)
 
+        # Scion hyperparams — overridable via environment variables for sweeps
+        scion_lr = float(os.environ.get("SCION_LR", 2**-12))
+        scion_momentum = float(os.environ.get("SCION_MOMENTUM", 0.1))
+        spectral_scale = float(os.environ.get("SCION_SPECTRAL_SCALE", 50))
+        lm_head_scale = float(os.environ.get("SCION_LM_HEAD_SCALE", 3000))
+        embed_scale = float(os.environ.get("SCION_EMBED_SCALE", 3000))
+        scalar_scale = float(os.environ.get("SCION_SCALAR_SCALE", 50))
+
         optim_groups = [
             {
                 "params": spectral_params,
                 "norm": "Spectral",
                 "norm_kwargs": {"steps": 5},
-                "scale": 50,
+                "scale": spectral_scale,
             },
             {
                 "params": lm_head_params,
                 "norm": "Sign",
                 "norm_kwargs": {"dim": 0},  # dim=0 for transposed (768, 50304) layout
-                "scale": 3000,
+                "scale": lm_head_scale,
             },
             {
                 "params": sign_matrix_params,
                 "norm": "Sign",
                 "norm_kwargs": {"dim": -1},
-                "scale": 3000,
+                "scale": embed_scale,
             },
             {
                 "params": sign_scalar_params,
                 "norm": "Sign",
                 "norm_kwargs": {"dim": -1},
-                "scale": 50,  # TODO: tune per-parameter scales
+                "scale": scalar_scale,
                 # "unconstrained": True,
             },
         ]
         self.optimizer = Scion(
             optim_groups,
-            lr=2**-12,
-            momentum=0.1,
+            lr=scion_lr,
+            momentum=scion_momentum,
             unconstrained=False,
         )
         # Store base learning rates for absolute (not multiplicative) LR scheduling
@@ -2458,6 +2468,22 @@ class TrainingManager:
 
 # -----------------------------------------------------------------------------
 # int main
+
+# Optional wandb logging for hyperparameter sweeps
+use_wandb = os.environ.get("WANDB_SWEEP", "0") == "1"
+if use_wandb and master_process:
+    import wandb
+
+    wandb.init(
+        config={
+            "scion_lr": float(os.environ.get("SCION_LR", 2**-12)),
+            "scion_momentum": float(os.environ.get("SCION_MOMENTUM", 0.1)),
+            "spectral_scale": float(os.environ.get("SCION_SPECTRAL_SCALE", 50)),
+            "lm_head_scale": float(os.environ.get("SCION_LM_HEAD_SCALE", 3000)),
+            "embed_scale": float(os.environ.get("SCION_EMBED_SCALE", 3000)),
+            "scalar_scale": float(os.environ.get("SCION_SCALAR_SCALE", 50)),
+        },
+    )
 
 # begin logging
 logfile = None
@@ -2631,6 +2657,15 @@ for step in range(train_steps + 1):
             f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms",
             console=True,
         )
+        if use_wandb and master_process:
+            wandb.log(
+                {
+                    "val_loss": val_loss.item(),
+                    "train_time_ms": training_time_ms,
+                    "step_avg_ms": training_time_ms / max(step, 1),
+                },
+                step=step,
+            )
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2672,4 +2707,6 @@ print0(
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
     console=True,
 )
+if use_wandb and master_process:
+    wandb.finish()
 dist.destroy_process_group()

@@ -925,8 +925,8 @@ def zeropower_via_newtonschulz5(G, steps=5):
     return X
 
 
-@torch.compile
-def zeropower_via_newtonschulz5_batched(G, steps=5):
+@torch.compile(dynamic=False, fullgraph=True)
+def zeropower_via_newtonschulz5_batched(G, steps=5, split_baddbmm=False):
     """
     Batched Newton-Schulz iteration for a batch of 2D matrices.
     G: (batch, rows, cols) -> returns orthogonalized matrices of same shape.
@@ -935,21 +935,36 @@ def zeropower_via_newtonschulz5_batched(G, steps=5):
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
-        X = X.transpose(-1, -2)
+        X = X.mT
 
     # Per-matrix Frobenius norm for stable iteration
     norms = X.flatten(-2).norm(dim=-1).unsqueeze(-1).unsqueeze(-1)
     X = X / (norms + 1e-7)
+
+    X = X.contiguous()
+    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+    B = torch.empty_like(A)
+    C = torch.empty_like(X)
+
+    if split_baddbmm:
+        BX_matmul = torch.bmm
+    else:
+        aX_plus_BX = torch.baddbmm
+
     # Perform the NS iterations
     for _ in range(steps):
-        A = X @ X.transpose(-1, -2)
-        B = (
-            b * A + c * A @ A
-        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+        # A = X @ X.transpose(-1, -2)
+        XXT(X, out=A)
+        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+        if split_baddbmm:
+            BX_matmul(B, X, out=C)
+            C.add_(X, alpha=a)
+        else:
+            aX_plus_BX(X, B, X, beta=a, out=C)
+        X, C = C, X
 
     if G.size(-2) > G.size(-1):
-        X = X.transpose(-1, -2)
+        X = X.mT
     return X
 
 
@@ -966,7 +981,8 @@ class Spectral(Norm):
         if g.ndim == 2:
             g = zeropower_via_newtonschulz5(g, steps=self.steps)
         elif g.ndim == 3:
-            g = zeropower_via_newtonschulz5_batched(g, steps=self.steps)
+            split_baddbmm = g.size(-2) > 1024
+            g = zeropower_via_newtonschulz5_batched(g, steps=self.steps, split_baddbmm=split_baddbmm)
         else:
             raise ValueError(f"Spectral LMO expects 2D or 3D tensor, got {g.ndim}D")
         d_out, d_in = g.shape[-2], g.shape[-1]
@@ -2118,7 +2134,7 @@ class TrainingSchedule:
 TRAINING_STAGES = [
     TrainingStage(
         duration=1 / 3,
-        batch_size=8 * 2048 * 8,
+        batch_size=16 * 2048 * 8,
         window_sizes=(1, 3),
         lr_mul=1.0,
         mtp_weights_start=[1.0, 0.5, 0.25],
@@ -2126,7 +2142,7 @@ TRAINING_STAGES = [
     ),
     TrainingStage(
         duration=1 / 3,
-        batch_size=16 * 2048 * 8,
+        batch_size=24 * 2048 * 8,
         window_sizes=(3, 7),
         lr_mul=1.52,  # (16/8)**0.6
         mtp_weights_start=[1.0, 0.5],
@@ -2134,7 +2150,7 @@ TRAINING_STAGES = [
     ),
     TrainingStage(
         duration=1 / 3,
-        batch_size=24 * 2048 * 8,
+        batch_size=32 * 2048 * 8,
         window_sizes=(5, 11),
         lr_mul=1.73,  # (24/8)**0.5
         mtp_weights_start=[1.0],
@@ -2142,7 +2158,7 @@ TRAINING_STAGES = [
     ),
     # extension stage
     TrainingStage(
-        batch_size=24 * 2048 * 8,
+        batch_size=32 * 2048 * 8,
         window_sizes=(6, 13),
         lr_mul=1.0,  # lr_mul is not used
         mtp_weights_start=[1.0],
@@ -2154,7 +2170,7 @@ training_schedule = TrainingSchedule(
     TRAINING_STAGES,
     args.num_scheduled_iterations,
     args.num_extension_iterations,
-    cooldown_frac=0.55,
+    cooldown_frac=0.28,
 )
 
 
@@ -2347,7 +2363,7 @@ class TrainingManager:
                 "params": sign_scalar_params,
                 "norm": "Sign",
                 "norm_kwargs": {"dim": -1},
-                "scale": 1,  # TODO: tune per-parameter scales
+                "scale": 50,  # TODO: tune per-parameter scales
                 # "unconstrained": True,
             },
         ]

@@ -16,8 +16,13 @@ import time
 import uuid
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
+from collections import defaultdict
 from pathlib import Path
 import gc
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -1000,7 +1005,150 @@ class Sign(Norm):
         return torch.sign(g) / g.size(self.dim)
 
 
-norm_dict = {"Spectral": Spectral, "Sign": Sign}
+class RmsNorm(Norm):
+    def __init__(self):
+
+        pass
+
+    def lmo(self, g):
+        """
+        Compute RMS norm for vectors: sqrt(mean(x^2)) over the last dimension.
+
+        Supports batched vectors of shape (..., d). Returns shape (...,).
+        Casts to float32 internally for stability.
+        """
+        g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
+        eps = 1e-12
+        dim = (-2, -1) if g_32.ndim >= 2 else -1
+        return torch.sqrt(torch.mean(g_32 * g_32, dim=dim, keepdim=True) + eps)
+
+
+class ColNorm(Norm):
+    def __init__(self):
+        pass
+
+    def _col_l2_norm(self, g):
+        """
+        Compute the L2 norm of each column of a matrix.
+        """
+        g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
+        eps = 1e-12
+        col_sq = torch.sum(g_32 * g_32, dim=-2)
+        return torch.sqrt(col_sq + eps)
+
+    def lmo(self, g):
+        """
+        ColNorm(W) = sqrt(d_out) * max_j ||col_j||_2
+
+        where W has shape (..., d_out, d_in). Returns shape (...,).
+        """
+        d_out = g.size(-2)
+        l2_norm = self._col_l2_norm(g)
+        max_l2 = torch.amax(l2_norm, dim=-1)
+        return max_l2 * math.sqrt(max(d_out, 1))
+
+
+norm_dict = {"Spectral": Spectral, "Sign": Sign, "RmsNorm": RmsNorm, "ColNorm": ColNorm}
+
+
+# -----------------------------------------------------------------------------
+# Spectral norm tracking and visualization
+
+
+@torch.no_grad()
+def compute_spectral_norms(optimizer):
+    """Compute spectral norms for each optimizer param group, broken down by layer.
+
+    For banked parameters (with a .reshape attribute), computes per-layer spectral
+    norms by grouping the reshaped sub-matrices by their logical layer.
+    For other 2D+ parameters, computes a single spectral norm (largest singular value).
+    For 1D parameters, computes the L2 norm.
+
+    Returns:
+        dict: {group_key: {layer_label: float}}
+              e.g. {"Spectral/attn": {"Layer 0": 7.3, "Layer 1": 6.8, ...}}
+    """
+    result = {}
+    for group in optimizer.param_groups:
+        norm_type = group["norm"]
+        for p in group["params"]:
+            label = getattr(p, "label", "unknown")
+            group_key = f"{norm_type}/{label}"
+            w = p.data.float()
+            reshape = getattr(p, "reshape", None)
+
+            if reshape is not None:
+                # Banked parameter: compute per-layer spectral norms
+                w_3d = w.reshape(reshape)
+                svs = torch.linalg.svdvals(w_3d)  # (batch, min(m,n))
+                spectral = svs[:, 0]  # largest singular value per matrix
+
+                if label in ("attn", "attn_bank"):
+                    # 4 sub-matrices per attention layer (Q, K, V, O)
+                    n_layers = spectral.shape[0] // 4
+                    result[group_key] = {
+                        f"Layer {i}": spectral[4 * i : 4 * (i + 1)].max().item()
+                        for i in range(n_layers)
+                    }
+                elif label in ("mlp", "mlp_bank"):
+                    # 2 sub-matrices per MLP layer (c_fc, c_proj); last entry is padding
+                    n_entries = spectral.shape[0] // 2
+                    result[group_key] = {
+                        f"Layer {i}": spectral[2 * i : 2 * (i + 1)].max().item()
+                        for i in range(n_entries - 1)  # exclude padding
+                    }
+                else:
+                    result[group_key] = {
+                        f"Matrix {i}": spectral[i].item()
+                        for i in range(spectral.shape[0])
+                    }
+            elif w.ndim >= 2:
+                sv = torch.linalg.svdvals(w)
+                result[group_key] = {label: sv[0].item()}
+            elif w.ndim == 1 and w.numel() > 1:
+                # Per-element view for 1D vectors (e.g. x0_lambdas per layer)
+                result[group_key] = {
+                    f"Element {i}": w[i].abs().item() for i in range(w.numel())
+                }
+            else:
+                result[group_key] = {label: w.norm().item()}
+    return result
+
+
+def plot_spectral_norm_history(norm_history, save_dir):
+    """Create one spectral norm plot per norm group, in the style of the Scion paper.
+
+    Each plot shows per-layer norms over training steps with a sequential colormap.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    for group_key, layer_data in sorted(norm_history.items()):
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # Sort layers naturally (Layer 0 < Layer 1 < ... < Layer 10)
+        sorted_layers = sorted(layer_data.keys(), key=lambda x: (len(x), x))
+        n_lines = len(sorted_layers)
+        cmap = plt.cm.get_cmap("viridis", max(n_lines, 2))
+
+        for idx, layer_label in enumerate(sorted_layers):
+            steps, norms = zip(*layer_data[layer_label])
+            color = cmap(idx / max(n_lines - 1, 1))
+            ax.plot(steps, norms, label=layer_label, color=color, linewidth=1.5)
+
+        ax.set_xlabel("Steps")
+        ax.set_ylabel("Spectral norm")
+        ax.set_title(f"Scion - {group_key}")
+        ax.legend()
+        ax.set_ylim(bottom=0)
+        fig.tight_layout()
+
+        safe_name = group_key.replace("/", "_").replace(" ", "_")
+        fig.savefig(
+            os.path.join(save_dir, f"norm_{safe_name}.png"),
+            dpi=150,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
 
 
 class Scion(torch.optim.Optimizer):
@@ -2328,19 +2476,30 @@ class TrainingManager:
         # Scalar/gate params use Sign norm with unconstrained updates.
         spectral_params = []  # Weight matrices: attn_bank, mlp_bank
         lm_head_params = []  # Output head (transposed layout)
-        sign_matrix_params = []  # Embeddings: embed, value_embed, bigram_embed
-        sign_scalar_params = []  # Gates, scalars, x0_lambdas, etc.
+        sign_matrix_params = []  # Embeddings: embed
+        col_norm_params = []  # Column-wise norms: value_embed, bigram_embed
+        rms_norm_params = []  # Gates, scalars, x0_lambdas, etc.
 
         for param in model.parameters():
             label = getattr(param, "label", None)
-            if label in ("attn", "mlp"):
+            if label in ("attn_bank", "mlp_bank"):
                 spectral_params.append(param)
             elif label == "lm_head":
                 lm_head_params.append(param)
-            elif label in ("embed", "value_embed", "bigram_embed"):
+            elif label == "embed":
                 sign_matrix_params.append(param)
+            elif label in ("value_embed", "bigram_embed"):
+                col_norm_params.append(param)
+            elif label in (
+                "smear_gate",
+                "skip_gate",
+                "attn_gate_bank",
+                "ve_gate_bank",
+                "x0_lambdas",
+            ):
+                rms_norm_params.append(param)
             else:
-                sign_scalar_params.append(param)
+                raise ValueError(f"Unknown parameter label: {label}")
 
         # Scion hyperparams — overridable via environment variables for sweeps
         scion_lr = float(os.environ.get("SCION_LR", 2**-12))
@@ -2348,7 +2507,8 @@ class TrainingManager:
         spectral_scale = float(os.environ.get("SCION_SPECTRAL_SCALE", 50))
         lm_head_scale = float(os.environ.get("SCION_LM_HEAD_SCALE", 3000))
         embed_scale = float(os.environ.get("SCION_EMBED_SCALE", 3000))
-        scalar_scale = float(os.environ.get("SCION_SCALAR_SCALE", 50))
+        col_norm_scale = float(os.environ.get("SCION_COL_NORM_SCALE", 50))
+        rms_norm_scale = float(os.environ.get("SCION_RMS_NORM_SCALE", 50))
 
         optim_groups = [
             {
@@ -2370,11 +2530,16 @@ class TrainingManager:
                 "scale": embed_scale,
             },
             {
-                "params": sign_scalar_params,
-                "norm": "Sign",
-                "norm_kwargs": {"dim": -1},
-                "scale": scalar_scale,
-                # "unconstrained": True,
+                "params": col_norm_params,
+                "norm": "ColNorm",
+                "norm_kwargs": {},
+                "scale": col_norm_scale,
+            },
+            {
+                "params": rms_norm_params,
+                "norm": "RmsNorm",
+                "norm_kwargs": {},
+                "scale": rms_norm_scale,
             },
         ]
         self.optimizer = Scion(
@@ -2622,6 +2787,10 @@ train_loader = distributed_data_generator(
 
 gc.collect()
 
+# Spectral norm tracking: log every N steps (configurable via env var)
+norm_log_every = int(os.environ.get("NORM_LOG_EVERY", "50"))
+norm_history = defaultdict(lambda: defaultdict(list)) if master_process else None
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -2700,12 +2869,25 @@ for step in range(train_steps + 1):
         ).backward()
     training_manager.step_optimizers(step)
 
+    # Log spectral norms periodically
+    if master_process and norm_log_every > 0 and step % norm_log_every == 0:
+        group_norms = compute_spectral_norms(training_manager.optimizer)
+        for group_key, layer_norms in group_norms.items():
+            for layer_label, norm_val in layer_norms.items():
+                norm_history[group_key][layer_label].append((step, norm_val))
+
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(
         f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
         console=True,
     )
+
+# Generate spectral norm plots
+if master_process and norm_history:
+    plot_dir = f"logs/{run_id}/norm_plots"
+    plot_spectral_norm_history(norm_history, plot_dir)
+    print0(f"Spectral norm plots saved to {plot_dir}", console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "

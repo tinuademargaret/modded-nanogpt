@@ -2032,7 +2032,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = (
-        1515  # number of steps to complete lr and ws schedule
+        710  # number of steps to complete lr and ws schedule
     )
     num_extension_iterations: int = (
         40  # number of steps to continue training at final lr and ws
@@ -2579,35 +2579,35 @@ val_loader = distributed_data_generator(
     align_to_bos=False,
 )
 
-transition_steps = training_manager.get_transition_steps()
-# first few steps plus transitions
-warmup_steps = sorted(
-    {0, 1, 2}
-    | set(
-        s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0
-    )
-)
-print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-for step in warmup_steps:
-    training_manager.advance_schedule(step)
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens = next(val_loader)
-        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-    model.train()
-    for idx in range(grad_accum_steps):
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (
-            model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-            * grad_scale
-        ).backward()
-    training_manager.step_optimizers(step)
-print0("Resetting Model", console=True)
-model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-training_manager.reset(initial_state["optimizer"])
-del val_loader, train_loader, initial_state
+# transition_steps = training_manager.get_transition_steps()
+# # first few steps plus transitions
+# warmup_steps = sorted(
+#     {0, 1, 2}
+#     | set(
+#         s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0
+#     )
+# )
+# print0(f"Sampling steps {warmup_steps} for warmup", console=True)
+# for step in warmup_steps:
+#     training_manager.advance_schedule(step)
+#     model.eval()
+#     with torch.no_grad():
+#         inputs, targets, cum_seqlens = next(val_loader)
+#         model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+#     model.train()
+#     for idx in range(grad_accum_steps):
+#         send_args = training_manager.train_loader_send_args
+#         inputs, targets, cum_seqlens = train_loader.send(send_args)
+#         (
+#             model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+#             * grad_scale
+#         ).backward()
+#     training_manager.step_optimizers(step)
+# print0("Resetting Model", console=True)
+# model.zero_grad(set_to_none=True)
+# model.load_state_dict(initial_state["model"])
+# training_manager.reset(initial_state["optimizer"])
+# del val_loader, train_loader, initial_state
 model.train()
 
 ########################################

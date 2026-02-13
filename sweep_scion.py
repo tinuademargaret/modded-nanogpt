@@ -20,6 +20,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 
 import wandb
 
@@ -31,7 +32,7 @@ SWEEP_CONFIG = {
     "metric": {"name": "val_loss", "goal": "minimize"},
     "early_terminate": {
         "type": "hyperband",
-        "min_iter": 500,  # minimum training steps before a trial can be killed
+        "min_iter": 2,  # minimum number of val_loss logs before a trial can be killed
         "eta": 3,
         "s": 2,
     },
@@ -40,8 +41,8 @@ SWEEP_CONFIG = {
         "scion_lr": {
             # Log-uniform over [2^-15, 2^-8] — centered around current 2^-12
             "distribution": "log_uniform_values",
-            "min": 2**-12,
-            "max": 2**-1,
+            "min": 2**-15,
+            "max": 2**-8,
         },
         "scion_momentum": {
             # Uniform over [0.01, 0.5] — current is 0.1
@@ -109,16 +110,21 @@ def train(nproc: int = 1):
 
     # Hand ownership of the wandb run to the subprocess.
     # Pass run ID, project, and entity so the child can resume the exact same run.
-    env["WANDB_RUN_ID"] = run.id
+    run_id = run.id
+    run_project = run.project
+    run_entity = run.entity
+
+    env["WANDB_RUN_ID"] = run_id
     env["WANDB_RESUME"] = "must"  # fail loudly if resume doesn't work
-    env["WANDB_PROJECT"] = run.project
-    if run.entity:
-        env["WANDB_ENTITY"] = run.entity
+    env["WANDB_PROJECT"] = run_project
+    if run_entity:
+        env["WANDB_ENTITY"] = run_entity
 
     # Release the run in the parent so the child is the sole writer.
     # The sweep controller tracks the run by ID, so it will pick up
     # the metrics logged by the child process.
     run.finish(quiet=True)
+    time.sleep(2)  # allow the wandb backend to fully release the run
 
     cmd = [
         "torchrun",
@@ -133,13 +139,21 @@ def train(nproc: int = 1):
     result = subprocess.run(
         cmd,
         env=env,
-        cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+        cwd=os.path.dirname(os.path.abspath(__file__)),
         stdout=sys.stdout,
         stderr=sys.stderr,
     )
 
     if result.returncode != 0:
         print(f"[sweep] Training failed with return code {result.returncode}")
+        # Re-init the run briefly to mark it as failed for the sweep controller
+        try:
+            failed_run = wandb.init(
+                id=run_id, resume="must", project=run_project, entity=run_entity
+            )
+            failed_run.finish(exit_code=1)
+        except Exception as e:
+            print(f"[sweep] Warning: could not mark run as failed: {e}")
 
 
 # ---------------------------------------------------------------------------

@@ -2474,16 +2474,21 @@ use_wandb = os.environ.get("WANDB_SWEEP", "0") == "1"
 if use_wandb and master_process:
     import wandb
 
-    wandb.init(
-        config={
-            "scion_lr": float(os.environ.get("SCION_LR", 2**-12)),
-            "scion_momentum": float(os.environ.get("SCION_MOMENTUM", 0.1)),
-            "spectral_scale": float(os.environ.get("SCION_SPECTRAL_SCALE", 50)),
-            "lm_head_scale": float(os.environ.get("SCION_LM_HEAD_SCALE", 3000)),
-            "embed_scale": float(os.environ.get("SCION_EMBED_SCALE", 3000)),
-            "scalar_scale": float(os.environ.get("SCION_SCALAR_SCALE", 50)),
-        },
-    )
+    # When resuming a sweep run (WANDB_RESUME is set by sweep_scion.py),
+    # skip passing config to avoid overwriting the sweep controller's config.
+    if os.environ.get("WANDB_RESUME"):
+        wandb.init()
+    else:
+        wandb.init(
+            config={
+                "scion_lr": float(os.environ.get("SCION_LR", 2**-12)),
+                "scion_momentum": float(os.environ.get("SCION_MOMENTUM", 0.1)),
+                "spectral_scale": float(os.environ.get("SCION_SPECTRAL_SCALE", 50)),
+                "lm_head_scale": float(os.environ.get("SCION_LM_HEAD_SCALE", 3000)),
+                "embed_scale": float(os.environ.get("SCION_EMBED_SCALE", 3000)),
+                "scalar_scale": float(os.environ.get("SCION_SCALAR_SCALE", 50)),
+            },
+        )
 
 # begin logging
 logfile = None

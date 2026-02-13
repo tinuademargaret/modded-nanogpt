@@ -29,13 +29,19 @@ import wandb
 SWEEP_CONFIG = {
     "method": "bayes",  # bayesian optimization
     "metric": {"name": "val_loss", "goal": "minimize"},
+    "early_terminate": {
+        "type": "hyperband",
+        "min_iter": 500,  # minimum training steps before a trial can be killed
+        "eta": 3,
+        "s": 2,
+    },
     "parameters": {
         # Primary sweep targets: lr and momentum
         "scion_lr": {
             # Log-uniform over [2^-15, 2^-8] — centered around current 2^-12
             "distribution": "log_uniform_values",
-            "min": 2**-15,
-            "max": 2**-8,
+            "min": 2**-12,
+            "max": 2**-1,
         },
         "scion_momentum": {
             # Uniform over [0.01, 0.5] — current is 0.1
@@ -101,9 +107,18 @@ def train(nproc: int = 1):
         config.get("scalar_scale", DEFAULTS["scalar_scale"])
     )
 
-    # Inherit WANDB_RUN_ID so the training process logs to the same run
+    # Hand ownership of the wandb run to the subprocess.
+    # Pass run ID, project, and entity so the child can resume the exact same run.
     env["WANDB_RUN_ID"] = run.id
-    env["WANDB_RESUME"] = "allow"
+    env["WANDB_RESUME"] = "must"  # fail loudly if resume doesn't work
+    env["WANDB_PROJECT"] = run.project
+    if run.entity:
+        env["WANDB_ENTITY"] = run.entity
+
+    # Release the run in the parent so the child is the sole writer.
+    # The sweep controller tracks the run by ID, so it will pick up
+    # the metrics logged by the child process.
+    run.finish(quiet=True)
 
     cmd = [
         "torchrun",
@@ -125,9 +140,6 @@ def train(nproc: int = 1):
 
     if result.returncode != 0:
         print(f"[sweep] Training failed with return code {result.returncode}")
-        wandb.finish(exit_code=1)
-    else:
-        wandb.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +189,10 @@ def main():
     # Create or resume sweep
     if args.sweep_id:
         sweep_id = args.sweep_id
+        # Extract entity/project from sweep ID (format: entity/project/sweep_id)
+        parts = sweep_id.split("/")
+        if len(parts) == 3:
+            args.entity, args.project = parts[0], parts[1]
         print(f"[sweep] Resuming sweep: {sweep_id}")
     else:
         sweep_id = wandb.sweep(

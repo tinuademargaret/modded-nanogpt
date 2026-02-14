@@ -248,7 +248,8 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # -----------------------------------------------------------------------------
-# Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
+# Triton kernel for MLP: 2*relu(x @ W1.T)^2 = (sqrt(2)*relu(x @ W1.T))^2, by @andrewbriand, @jrauvola
+# The sqrt(2) scaling preserves variance through the ReLU (which zeroes ~half the entries).
 
 @triton.jit
 def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
@@ -296,25 +297,25 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            c0 = 4 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
 
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
         if FORWARD:
             c0_post = tl.maximum(c0, 0)
-            c0_post = c0_post * c0_post
+            c0_post = 2.0 * c0_post * c0_post
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
         c1 = acc1.to(dtype)
         if not FORWARD:
             c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+            c1 = 4 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
 
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
-            c1_post = c1_post * c1_post
+            c1_post = 2.0 * c1_post * c1_post
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 

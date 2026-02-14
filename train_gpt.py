@@ -942,7 +942,6 @@ def zeropower_via_newtonschulz5_batched(G, steps=5, split_baddbmm=False):
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # Per-matrix Frobenius norm for stable iteration
     norms = X.flatten(-2).norm(dim=-1).unsqueeze(-1).unsqueeze(-1)
     X = X / (norms + 1e-7)
 
@@ -1012,40 +1011,37 @@ class RmsNorm(Norm):
 
     def lmo(self, g):
         """
-        Compute RMS norm for vectors: sqrt(mean(x^2)) over the last dimension.
+        RMS-normalize the gradient: g / rms(g).
 
-        Supports batched vectors of shape (..., d). Returns shape (...,).
+        Supports batched vectors of shape (..., d).
+        Returns a direction tensor with the same shape as g, having unit RMS norm.
         Casts to float32 internally for stability.
         """
         g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
         eps = 1e-12
         dim = (-2, -1) if g_32.ndim >= 2 else -1
-        return torch.sqrt(torch.mean(g_32 * g_32, dim=dim, keepdim=True) + eps)
+        rms = torch.sqrt(torch.mean(g_32 * g_32, dim=dim, keepdim=True) + eps)
+        return g / rms
 
 
 class ColNorm(Norm):
     def __init__(self):
         pass
 
-    def _col_l2_norm(self, g):
-        """
-        Compute the L2 norm of each column of a matrix.
-        """
-        g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
-        eps = 1e-12
-        col_sq = torch.sum(g_32 * g_32, dim=-2)
-        return torch.sqrt(col_sq + eps)
-
     def lmo(self, g):
         """
-        ColNorm(W) = sqrt(d_out) * max_j ||col_j||_2
+        ColNorm LMO from Table 2 of the paper (1 -> RMS operator norm):
+            col_j(A) -> sqrt(d_out) * col_j(A) / ||col_j(A)||_2
 
-        where W has shape (..., d_out, d_in). Returns shape (...,).
+        Normalizes each column independently by its L2 norm, then scales
+        by sqrt(d_out). Returns a direction tensor with the same shape as g.
         """
         d_out = g.size(-2)
-        l2_norm = self._col_l2_norm(g)
-        max_l2 = torch.amax(l2_norm, dim=-1)
-        return max_l2 * math.sqrt(max(d_out, 1))
+        g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
+        eps = 1e-12
+        # L2 norm of each column, with keepdim for broadcasting over rows
+        col_norms = torch.sqrt(torch.sum(g_32 * g_32, dim=-2, keepdim=True) + eps)
+        return math.sqrt(max(d_out, 1)) * g / col_norms
 
 
 norm_dict = {"Spectral": Spectral, "Sign": Sign, "RmsNorm": RmsNorm, "ColNorm": ColNorm}
@@ -1077,20 +1073,20 @@ def compute_spectral_norms(optimizer):
             w = p.data.float()
             reshape = getattr(p, "reshape", None)
 
-            if reshape is not None:
+            if isinstance(reshape, tuple):
                 # Banked parameter: compute per-layer spectral norms
                 w_3d = w.reshape(reshape)
                 svs = torch.linalg.svdvals(w_3d)  # (batch, min(m,n))
                 spectral = svs[:, 0]  # largest singular value per matrix
 
-                if label in ("attn", "attn_bank"):
+                if label == "attn":
                     # 4 sub-matrices per attention layer (Q, K, V, O)
                     n_layers = spectral.shape[0] // 4
                     result[group_key] = {
                         f"Layer {i}": spectral[4 * i : 4 * (i + 1)].max().item()
                         for i in range(n_layers)
                     }
-                elif label in ("mlp", "mlp_bank"):
+                elif label == "mlp":
                     # 2 sub-matrices per MLP layer (c_fc, c_proj); last entry is padding
                     n_entries = spectral.shape[0] // 2
                     result[group_key] = {
@@ -1103,6 +1099,9 @@ def compute_spectral_norms(optimizer):
                         for i in range(spectral.shape[0])
                     }
             elif w.ndim >= 2:
+                if w.ndim > 2:
+                    # Flatten to 2D for SVD (treat leading dims as rows)
+                    w = w.reshape(-1, w.shape[-1])
                 sv = torch.linalg.svdvals(w)
                 result[group_key] = {label: sv[0].item()}
             elif w.ndim == 1 and w.numel() > 1:
@@ -1184,7 +1183,6 @@ class Scion(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         # Locate lm_head and embed parameters by label for weight tying.
-        # Both must be present — tying is a core part of the training recipe.
         self._lm_head_param = None
         self._embed_param = None
         for group in self.param_groups:
@@ -1202,6 +1200,7 @@ class Scion(torch.optim.Optimizer):
     def step(self):
         # While tied: merge embed gradient into lm_head, suppress embed update.
         # Scion skips params with grad=None, so embed won't be updated below.
+        # It also uses the lm_head scale for the embed when it is tied.
         if not self._is_split:
             if (
                 self._lm_head_param.grad is not None
@@ -1235,7 +1234,11 @@ class Scion(torch.optim.Optimizer):
                     buf.mul_(1 - momentum).add_(g, alpha=momentum)
                     g = buf
 
-                update = scale * norm_backend.lmo(g)
+                if group["norm"] == "Spectral":
+                    is_large_matrix = g.size(-2) > 1024
+                    update = scale * polar_express(g, split_baddbmm=is_large_matrix)
+                else:
+                    update = scale * norm_backend.lmo(g)
 
                 # Reshape update back to original parameter shape
                 if target_shape is not None and group["norm"] == "Spectral":
@@ -2180,7 +2183,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = (
-        710  # number of steps to complete lr and ws schedule
+        1515  # number of steps to complete lr and ws schedule
     )
     num_extension_iterations: int = (
         40  # number of steps to continue training at final lr and ws
@@ -2320,7 +2323,7 @@ training_schedule = TrainingSchedule(
     TRAINING_STAGES,
     args.num_scheduled_iterations,
     args.num_extension_iterations,
-    cooldown_frac=0.28,
+    cooldown_frac=0.55,
 )
 
 
@@ -2482,7 +2485,7 @@ class TrainingManager:
 
         for param in model.parameters():
             label = getattr(param, "label", None)
-            if label in ("attn_bank", "mlp_bank"):
+            if label in ("attn", "mlp"):
                 spectral_params.append(param)
             elif label == "lm_head":
                 lm_head_params.append(param)
@@ -2496,19 +2499,20 @@ class TrainingManager:
                 "attn_gate_bank",
                 "ve_gate_bank",
                 "x0_lambdas",
+                "scalars",
             ):
                 rms_norm_params.append(param)
             else:
                 raise ValueError(f"Unknown parameter label: {label}")
 
         # Scion hyperparams — overridable via environment variables for sweeps
-        scion_lr = float(os.environ.get("SCION_LR", 2**-12))
-        scion_momentum = float(os.environ.get("SCION_MOMENTUM", 0.1))
-        spectral_scale = float(os.environ.get("SCION_SPECTRAL_SCALE", 50))
+        scion_lr = float(os.environ.get("SCION_LR", 0.0003678))
+        scion_momentum = float(os.environ.get("SCION_MOMENTUM", 0.16))
+        spectral_scale = float(os.environ.get("SCION_SPECTRAL_SCALE", 50.6))
         lm_head_scale = float(os.environ.get("SCION_LM_HEAD_SCALE", 3000))
-        embed_scale = float(os.environ.get("SCION_EMBED_SCALE", 3000))
-        col_norm_scale = float(os.environ.get("SCION_COL_NORM_SCALE", 50))
-        rms_norm_scale = float(os.environ.get("SCION_RMS_NORM_SCALE", 50))
+        embed_scale = float(os.environ.get("SCION_EMBED_SCALE", 824.5))
+        col_norm_scale = float(os.environ.get("SCION_COL_NORM_SCALE", 108.8))
+        rms_norm_scale = float(os.environ.get("SCION_RMS_NORM_SCALE", 4.3))
 
         optim_groups = [
             {
@@ -2634,26 +2638,10 @@ class TrainingManager:
 # -----------------------------------------------------------------------------
 # int main
 
-# Optional wandb logging for hyperparameter sweeps
-use_wandb = os.environ.get("WANDB_SWEEP", "0") == "1"
-if use_wandb and master_process:
-    import wandb
-
-    # When resuming a sweep run (WANDB_RESUME is set by sweep_scion.py),
-    # skip passing config to avoid overwriting the sweep controller's config.
-    if os.environ.get("WANDB_RESUME"):
-        wandb.init()
-    else:
-        wandb.init(
-            config={
-                "scion_lr": float(os.environ.get("SCION_LR", 2**-12)),
-                "scion_momentum": float(os.environ.get("SCION_MOMENTUM", 0.1)),
-                "spectral_scale": float(os.environ.get("SCION_SPECTRAL_SCALE", 50)),
-                "lm_head_scale": float(os.environ.get("SCION_LM_HEAD_SCALE", 3000)),
-                "embed_scale": float(os.environ.get("SCION_EMBED_SCALE", 3000)),
-                "scalar_scale": float(os.environ.get("SCION_SCALAR_SCALE", 50)),
-            },
-        )
+# Optional metrics logging for hyperparameter sweeps.
+# When SWEEP_METRICS_FILE is set, metrics are written to that file as JSON-lines
+# for the parent sweep process to read. No wandb init happens here.
+sweep_metrics_file = os.environ.get("SWEEP_METRICS_FILE") if master_process else None
 
 # begin logging
 logfile = None
@@ -2744,35 +2732,35 @@ val_loader = distributed_data_generator(
     align_to_bos=False,
 )
 
-# transition_steps = training_manager.get_transition_steps()
-# # first few steps plus transitions
-# warmup_steps = sorted(
-#     {0, 1, 2}
-#     | set(
-#         s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0
-#     )
-# )
-# print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-# for step in warmup_steps:
-#     training_manager.advance_schedule(step)
-#     model.eval()
-#     with torch.no_grad():
-#         inputs, targets, cum_seqlens = next(val_loader)
-#         model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-#     model.train()
-#     for idx in range(grad_accum_steps):
-#         send_args = training_manager.train_loader_send_args
-#         inputs, targets, cum_seqlens = train_loader.send(send_args)
-#         (
-#             model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-#             * grad_scale
-#         ).backward()
-#     training_manager.step_optimizers(step)
-# print0("Resetting Model", console=True)
-# model.zero_grad(set_to_none=True)
-# model.load_state_dict(initial_state["model"])
-# training_manager.reset(initial_state["optimizer"])
-# del val_loader, train_loader, initial_state
+transition_steps = training_manager.get_transition_steps()
+# first few steps plus transitions
+warmup_steps = sorted(
+    {0, 1, 2}
+    | set(
+        s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0
+    )
+)
+print0(f"Sampling steps {warmup_steps} for warmup", console=True)
+for step in warmup_steps:
+    training_manager.advance_schedule(step)
+    model.eval()
+    with torch.no_grad():
+        inputs, targets, cum_seqlens = next(val_loader)
+        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+    model.train()
+    for idx in range(grad_accum_steps):
+        send_args = training_manager.train_loader_send_args
+        inputs, targets, cum_seqlens = train_loader.send(send_args)
+        (
+            model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+            * grad_scale
+        ).backward()
+    training_manager.step_optimizers(step)
+print0("Resetting Model", console=True)
+model.zero_grad(set_to_none=True)
+model.load_state_dict(initial_state["model"])
+training_manager.reset(initial_state["optimizer"])
+del val_loader, train_loader, initial_state
 model.train()
 
 ########################################
@@ -2831,15 +2819,22 @@ for step in range(train_steps + 1):
             f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms",
             console=True,
         )
-        if use_wandb and master_process:
-            wandb.log(
-                {
-                    "val_loss": val_loss.item(),
-                    "train_time_ms": training_time_ms,
-                    "step_avg_ms": training_time_ms / max(step, 1),
-                },
-                step=step,
-            )
+        if sweep_metrics_file:
+            import json
+
+            with open(sweep_metrics_file, "a") as _mf:
+                _mf.write(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "val_loss": val_loss.item(),
+                            "train_time_ms": training_time_ms,
+                            "step_avg_ms": training_time_ms / max(step, 1),
+                        }
+                    )
+                    + "\n"
+                )
+                _mf.flush()
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2894,6 +2889,4 @@ print0(
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
     console=True,
 )
-if use_wandb and master_process:
-    wandb.finish()
 dist.destroy_process_group()

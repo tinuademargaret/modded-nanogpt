@@ -1017,10 +1017,10 @@ class RmsNorm(Norm):
         Returns a direction tensor with the same shape as g, having unit RMS norm.
         Casts to float32 internally for stability.
         """
-        g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
+        # g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
         eps = 1e-12
-        dim = (-2, -1) if g_32.ndim >= 2 else -1
-        rms = torch.sqrt(torch.mean(g_32 * g_32, dim=dim, keepdim=True) + eps)
+        dim = (-2, -1) if g.ndim >= 2 else -1
+        rms = torch.sqrt(torch.mean(g * g, dim=dim, keepdim=True) + eps)
         return g / rms
 
 
@@ -1037,10 +1037,10 @@ class ColNorm(Norm):
         by sqrt(d_out). Returns a direction tensor with the same shape as g.
         """
         d_out = g.size(-2)
-        g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
+        # g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
         eps = 1e-12
         # L2 norm of each column, with keepdim for broadcasting over rows
-        col_norms = torch.sqrt(torch.sum(g_32 * g_32, dim=-2, keepdim=True) + eps)
+        col_norms = torch.sqrt(torch.sum(g * g, dim=-2, keepdim=True) + eps)
         return math.sqrt(max(d_out, 1)) * g / col_norms
 
 
@@ -2323,7 +2323,7 @@ training_schedule = TrainingSchedule(
     TRAINING_STAGES,
     args.num_scheduled_iterations,
     args.num_extension_iterations,
-    cooldown_frac=0.55,
+    cooldown_frac=0.28,
 )
 
 

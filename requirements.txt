@@ -5,3 +5,4 @@ huggingface-hub
 kernels
 setuptools
 typing-extensions==4.15.0
+matplotlib

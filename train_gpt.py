@@ -2358,6 +2358,14 @@ class TrainingManager:
 
     def __init__(self, model):
         self.model = model
+        # Unwrap DDP/compile layers to access model attributes like .yarn directly
+        # Unwrap order must be the reverse of wrapping order (compile then DDP)
+        raw = model
+        if hasattr(raw, "module"):  # DDP wrapper (outermost)
+            raw = raw.module
+        if hasattr(raw, "_orig_mod"):  # torch.compile wrapper (inner)
+            raw = raw._orig_mod
+        self.raw_model = raw
         self.block_size = 128
 
         # - Ordering dictates when to launch reduce/reduce_scatter operations
@@ -2582,10 +2590,10 @@ class TrainingManager:
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
         if new_ws_long != self.ws_long:
-            self.model.yarn.apply(
+            self.raw_model.yarn.apply(
                 self.ws_long * self.block_size, new_ws_long * self.block_size
             )
-            self.model.yarn_paired_head.apply(
+            self.raw_model.yarn_paired_head.apply(
                 self.ws_long * self.block_size, new_ws_long * self.block_size
             )
 
@@ -2628,8 +2636,8 @@ class TrainingManager:
         stage, _ = training_schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
-        self.model.yarn.reset()
-        self.model.yarn_paired_head.reset()
+        self.raw_model.yarn.reset()
+        self.raw_model.yarn_paired_head.reset()
 
     def get_state(self):
         return copy.deepcopy(self.optimizer.state_dict())
@@ -2700,11 +2708,10 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-# Wrap in DDP so gradients are all-reduced in backward (enables Scion with multi-GPU)
+# Compile first, then wrap in DDP (compile inside DDP avoids graph breaks from DDP internals)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 if world_size > 1:
     model = DDP(model, device_ids=[device.index], output_device=device)
-
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################

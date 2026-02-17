@@ -2287,7 +2287,7 @@ class TrainingSchedule:
 TRAINING_STAGES = [
     TrainingStage(
         duration=1 / 3,
-        batch_size=16 * 2048 * 8,
+        batch_size=8 * 2048 * 8,
         window_sizes=(1, 3),
         lr_mul=1.0,
         mtp_weights_start=[1.0, 0.5, 0.25],
@@ -2295,7 +2295,7 @@ TRAINING_STAGES = [
     ),
     TrainingStage(
         duration=1 / 3,
-        batch_size=24 * 2048 * 8,
+        batch_size=16 * 2048 * 8,
         window_sizes=(3, 7),
         lr_mul=1.52,  # (16/8)**0.6
         mtp_weights_start=[1.0, 0.5],
@@ -2303,7 +2303,7 @@ TRAINING_STAGES = [
     ),
     TrainingStage(
         duration=1 / 3,
-        batch_size=32 * 2048 * 8,
+        batch_size=24 * 2048 * 8,
         window_sizes=(5, 11),
         lr_mul=1.73,  # (24/8)**0.5
         mtp_weights_start=[1.0],
@@ -2311,7 +2311,7 @@ TRAINING_STAGES = [
     ),
     # extension stage
     TrainingStage(
-        batch_size=32 * 2048 * 8,
+        batch_size=24 * 2048 * 8,
         window_sizes=(6, 13),
         lr_mul=1.0,  # lr_mul is not used
         mtp_weights_start=[1.0],

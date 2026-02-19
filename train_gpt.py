@@ -957,7 +957,6 @@ def zeropower_via_newtonschulz5_batched(G, steps=5, split_baddbmm=False):
 
     # Perform the NS iterations
     for _ in range(steps):
-        # A = X @ X.transpose(-1, -2)
         XXT(X, out=A)
         ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
         if split_baddbmm:
@@ -1015,9 +1014,7 @@ class RmsNorm(Norm):
 
         Supports batched vectors of shape (..., d).
         Returns a direction tensor with the same shape as g, having unit RMS norm.
-        Casts to float32 internally for stability.
         """
-        # g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
         eps = 1e-12
         dim = (-2, -1) if g.ndim >= 2 else -1
         rms = torch.sqrt(torch.mean(g * g, dim=dim, keepdim=True) + eps)
@@ -1037,7 +1034,6 @@ class ColNorm(Norm):
         by sqrt(d_out). Returns a direction tensor with the same shape as g.
         """
         d_out = g.size(-2)
-        # g_32 = g.to(torch.float32) if g.dtype != torch.float32 else g
         eps = 1e-12
         # L2 norm of each column, with keepdim for broadcasting over rows
         col_norms = torch.sqrt(torch.sum(g * g, dim=-2, keepdim=True) + eps)
@@ -2368,123 +2364,7 @@ class TrainingManager:
         self.raw_model = raw
         self.block_size = 128
 
-        # - Ordering dictates when to launch reduce/reduce_scatter operations
-        # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
-        # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
-        # self.param_table = {
-        #     "attn": {"optim": "normuon", "comms": "sharded", "adam_betas": None},
-        #     "mlp": {"optim": "normuon", "comms": "sharded", "adam_betas": None},
-        #     "scalars": {
-        #         "optim": "adam",
-        #         "comms": "replicated",
-        #         "adam_betas": [0.9, 0.99],
-        #         "lr_mul": 5.0,
-        #         "wd_mul": 0.0,
-        #     },
-        #     "value_embed": {
-        #         "optim": "adam",
-        #         "comms": "sharded",
-        #         "adam_betas": [0.75, 0.95],
-        #         "lr_mul": 75.0,
-        #         "wd_mul": 5.0,
-        #     },
-        #     "bigram_embed": {
-        #         "optim": "adam",
-        #         "comms": "sharded",
-        #         "adam_betas": [0.75, 0.95],
-        #         "lr_mul": 75.0,
-        #         "wd_mul": 5.0,
-        #     },
-        #     "smear_gate": {
-        #         "optim": "adam",
-        #         "comms": "replicated",
-        #         "adam_betas": [0.9, 0.99],
-        #         "lr_mul": 0.01,
-        #         "wd_mul": 0.0,
-        #     },
-        #     "skip_gate": {
-        #         "optim": "adam",
-        #         "comms": "replicated",
-        #         "adam_betas": [0.9, 0.99],
-        #         "lr_mul": 0.05,
-        #         "wd_mul": 0.0,
-        #     },
-        #     "attn_gate_bank": {
-        #         "optim": "adam",
-        #         "comms": "replicated",
-        #         "adam_betas": [0.9, 0.99],
-        #     },
-        #     "ve_gate_bank": {
-        #         "optim": "adam",
-        #         "comms": "replicated",
-        #         "adam_betas": [0.9, 0.99],
-        #     },
-        #     "x0_lambdas": {
-        #         "optim": "adam",
-        #         "comms": "replicated",
-        #         "adam_betas": [0.65, 0.95],
-        #         "lr_mul": 5.0,
-        #         "wd_mul": 0.0,
-        #     },
-        #     "lm_head": {
-        #         "optim": "adam",
-        #         "comms": "sharded",
-        #         "adam_betas": [0.5, 0.95],
-        #         "wd_mul": 150.0,
-        #     },
-        #     "embed": {
-        #         "optim": "adam",
-        #         "comms": "sharded",
-        #         "adam_betas": [0.5, 0.95],
-        #         "wd_mul": 150.0,
-        #     },
-        # }
-
-        # # - Process smaller/faster params first while large reduces complete
-        # # - lm_head must complete before embed sync (when tied)
-        # self.work_order = [
-        #     "scalars",
-        #     "smear_gate",
-        #     "skip_gate",
-        #     "attn_gate_bank",
-        #     "ve_gate_bank",
-        #     "x0_lambdas",  # Small, fast
-        #     "value_embed",
-        #     "bigram_embed",  # Medium
-        #     "lm_head",
-        #     "embed",  # lm_head must complete before embed sync (when tied)
-        #     "attn",
-        #     "mlp",  # Large, polar express - process last to maximize overlap
-        # ]
-
-        # adam_defaults = dict(
-        #     lr=0.008,
-        #     eps=1e-10,
-        #     weight_decay=0.005,
-        # )
-
-        # normuon_defaults = dict(
-        #     lr=0.023,
-        #     momentum=0.95,
-        #     beta2=0.95,
-        #     weight_decay=1.2,
-        # )
-
-        # self.optimizer = NorMuonAndAdam(
-        #     model.named_parameters(),
-        #     param_table=self.param_table,
-        #     scatter_order=list(
-        #         self.param_table.keys()
-        #     ),  # Dict order defines scatter priority
-        #     work_order=self.work_order,
-        #     adam_defaults=adam_defaults,
-        #     normuon_defaults=normuon_defaults,
-        # )
         # Categorize all model parameters by their optimization strategy.
-        # Bank params (attn_bank, mlp_bank) use Spectral norm with Newton-Schulz.
-        # The lm_head uses Sign norm (dim=0 for transposed CastedLinearT layout).
-        # Embedding matrices use Sign norm (dim=-1, standard layout).
-        # Scalar/gate params use Sign norm with unconstrained updates.
         spectral_params = []  # Weight matrices: attn_bank, mlp_bank
         lm_head_params = []  # Output head (transposed layout)
         sign_matrix_params = []  # Embeddings: embed
@@ -2513,14 +2393,14 @@ class TrainingManager:
             else:
                 raise ValueError(f"Unknown parameter label: {label}")
 
-        # Scion hyperparams — overridable via environment variables for sweeps
+        # Scion hyperparams
         scion_lr = float(os.environ.get("SCION_LR", 0.0003678))
         scion_momentum = float(os.environ.get("SCION_MOMENTUM", 0.16))
-        spectral_scale = float(os.environ.get("SCION_SPECTRAL_SCALE", 50.6))
-        lm_head_scale = float(os.environ.get("SCION_LM_HEAD_SCALE", 3000))
-        embed_scale = float(os.environ.get("SCION_EMBED_SCALE", 824.5))
-        col_norm_scale = float(os.environ.get("SCION_COL_NORM_SCALE", 108.8))
-        rms_norm_scale = float(os.environ.get("SCION_RMS_NORM_SCALE", 4.3))
+        spectral_scale = float(os.environ.get("SCION_SPECTRAL_SCALE", 98.4))
+        lm_head_scale = float(os.environ.get("SCION_LM_HEAD_SCALE", 5127.3))
+        embed_scale = float(os.environ.get("SCION_EMBED_SCALE", 4371.5))
+        col_norm_scale = float(os.environ.get("SCION_COL_NORM_SCALE", 187.5))
+        rms_norm_scale = float(os.environ.get("SCION_RMS_NORM_SCALE", 7.2))
 
         optim_groups = [
             {

@@ -981,6 +981,9 @@ class Spectral(Norm):
         self.steps = steps
 
     def lmo(self, g):
+        # is_large_matrix = g.size(-2) > 1024
+        # g = polar_express(g, split_baddbmm=is_large_matrix)
+
         if g.ndim == 2:
             g = zeropower_via_newtonschulz5(g, steps=self.steps)
         elif g.ndim == 3:
@@ -1230,11 +1233,7 @@ class Scion(torch.optim.Optimizer):
                     buf.mul_(1 - momentum).add_(g, alpha=momentum)
                     g = buf
 
-                if group["norm"] == "Spectral":
-                    is_large_matrix = g.size(-2) > 1024
-                    update = scale * polar_express(g, split_baddbmm=is_large_matrix)
-                else:
-                    update = scale * norm_backend.lmo(g)
+                update = scale * norm_backend.lmo(g)
 
                 # Reshape update back to original parameter shape
                 if target_shape is not None and group["norm"] == "Spectral":
@@ -2438,7 +2437,7 @@ class TrainingManager:
             optim_groups,
             lr=scion_lr,
             momentum=scion_momentum,
-            unconstrained=False,
+            unconstrained=True,
         )
         # Store base learning rates for absolute (not multiplicative) LR scheduling
         for group in self.optimizer.param_groups:
@@ -2663,7 +2662,7 @@ train_loader = distributed_data_generator(
 gc.collect()
 
 # Spectral norm tracking: log every N steps (configurable via env var)
-norm_log_every = int(os.environ.get("NORM_LOG_EVERY", "50"))
+norm_log_every = int(os.environ.get("NORM_LOG_EVERY", "0"))
 norm_history = defaultdict(lambda: defaultdict(list)) if master_process else None
 
 training_time_ms = 0
